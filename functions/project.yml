@@ -1,0 +1,11 @@
+packages:
+  - name: fibonacci
+    environment:
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+    actions:
+      - name: __main__
+        runtime: python:default
+        web: true
+        limits:
+          timeout: 60000  # 60 seconds
+          memory: 512     # 512 MB
