@@ -7,6 +7,7 @@ This worker demonstrates the polling pattern for heavy analyzers:
 3. Runs fibonacci calculation (simulates heavy work)
 4. CPU spike triggers autoscaling
 5. Scales down when no work available
+6. Runs 3 tasks in parallel per instance (maxes out single CPU)
 
 Data Model:
     {
@@ -26,6 +27,8 @@ import time
 import logging
 from datetime import datetime
 from pymongo import MongoClient, ReturnDocument
+from multiprocessing import Pool
+from functools import partial
 
 # Configure logging
 logging.basicConfig(
@@ -82,27 +85,44 @@ def try_claim_work(db):
     return work
 
 
-def process_work(db, work):
+def process_work(work):
     """
     Process the claimed work (run fibonacci calculation).
+    This runs in a separate process.
 
     Args:
-        db: MongoDB database
         work: The work item to process
+
+    Returns:
+        tuple: (request_id, result, duration)
     """
     request_id = work.get("request_id")
     n = work.get("n", 40)
 
-    logger.info(f"[{POD_ID}] Processing request {request_id}, fibonacci({n})...")
+    worker_pid = os.getpid()
+    logger.info(f"[{POD_ID}-worker-{worker_pid}] Processing request {request_id}, fibonacci({n})...")
 
     # Heavy work - CPU spikes here, triggers autoscaling
     start_time = time.time()
     result = fibonacci(n)
     duration = time.time() - start_time
 
-    logger.info(f"[{POD_ID}] Completed in {duration:.2f}s. Result: {result}")
+    logger.info(f"[{POD_ID}-worker-{worker_pid}] Completed in {duration:.2f}s. Result: {result}")
 
-    # Mark as completed
+    return (request_id, result, duration)
+
+
+def mark_completed(db, result_tuple):
+    """
+    Mark work as completed in database.
+    Called from main thread after worker finishes.
+
+    Args:
+        db: MongoDB database
+        result_tuple: (request_id, result, duration)
+    """
+    request_id, result, duration = result_tuple
+
     db.requests.update_one(
         {"request_id": request_id},
         {
@@ -114,36 +134,65 @@ def process_work(db, work):
             }
         }
     )
+    logger.info(f"[{POD_ID}] Marked {request_id} as completed")
 
 
 def main():
     """
-    Main worker loop - polls for work and processes it.
+    Main worker loop - polls for work and processes it in parallel.
 
-    This runs continuously as a worker process.
+    Runs up to 3 fibonacci calculations concurrently per instance.
     """
-    logger.info(f"[{POD_ID}] Worker started, polling for work...")
+    logger.info(f"[{POD_ID}] Worker started with 3 parallel workers...")
 
     db = get_mongo_db()
 
-    while True:
-        try:
-            # Try to claim work
-            work = try_claim_work(db)
+    # Create pool of 3 worker processes
+    with Pool(processes=3) as pool:
+        active_tasks = []  # List of (AsyncResult, work_dict) tuples
 
-            if work:
-                # Found work, process it
-                process_work(db, work)
-                # Immediately check for more work (no sleep)
+        while True:
+            try:
+                # Clean up completed tasks
+                still_active = []
+                for async_result, work in active_tasks:
+                    if async_result.ready():
+                        # Task completed, mark in database
+                        try:
+                            result_tuple = async_result.get()
+                            mark_completed(db, result_tuple)
+                        except Exception as e:
+                            logger.error(f"[{POD_ID}] Error completing task: {e}", exc_info=True)
+                    else:
+                        # Still running
+                        still_active.append((async_result, work))
 
-            else:
-                # No work available, idle for 5 seconds
-                logger.info(f"[{POD_ID}] No work available, sleeping 5s...")
+                active_tasks = still_active
+
+                # Try to claim more work if we have capacity
+                if len(active_tasks) < 3:
+                    work = try_claim_work(db)
+
+                    if work:
+                        # Submit work to pool
+                        logger.info(f"[{POD_ID}] Claimed work, submitting to pool ({len(active_tasks)+1}/3 slots used)")
+                        async_result = pool.apply_async(process_work, (work,))
+                        active_tasks.append((async_result, work))
+                        # Immediately try to claim more work
+                        continue
+
+                # If pool is full or no work available, sleep briefly
+                if len(active_tasks) >= 3:
+                    logger.debug(f"[{POD_ID}] All 3 workers busy, waiting...")
+                    time.sleep(1)  # Short sleep, check for completions soon
+                else:
+                    # No work available and pool not full
+                    logger.info(f"[{POD_ID}] No work available, sleeping 5s...")
+                    time.sleep(5)
+
+            except Exception as e:
+                logger.error(f"[{POD_ID}] Error in main loop: {e}", exc_info=True)
                 time.sleep(5)
-
-        except Exception as e:
-            logger.error(f"[{POD_ID}] Error in worker loop: {e}", exc_info=True)
-            time.sleep(5)  # Sleep on error to avoid tight loop
 
 
 if __name__ == "__main__":
