@@ -25,6 +25,7 @@ import os
 import socket
 import time
 import logging
+import random
 from datetime import datetime
 from pymongo import MongoClient, ReturnDocument
 from multiprocessing import Pool
@@ -94,22 +95,30 @@ def process_work(work):
         work: The work item to process
 
     Returns:
-        tuple: (request_id, result, duration)
+        tuple: (request_id, result, duration, error)
+        error is None on success, or error message on failure
     """
     request_id = work.get("request_id")
     n = work.get("n", 40)
-
     worker_pid = os.getpid()
-    logger.info(f"[{POD_ID}-worker-{worker_pid}] Processing request {request_id}, fibonacci({n})...")
 
-    # Heavy work - CPU spikes here, triggers autoscaling
-    start_time = time.time()
-    result = fibonacci(n)
-    duration = time.time() - start_time
+    try:
+        logger.info(f"[{POD_ID}-worker-{worker_pid}] Processing request {request_id}, fibonacci({n})...")
 
-    logger.info(f"[{POD_ID}-worker-{worker_pid}] Completed in {duration:.2f}s. Result: {result}")
+        # Heavy work - CPU spikes here, triggers autoscaling
+        start_time = time.time()
+        result = fibonacci(n)
+        duration = time.time() - start_time
 
-    return (request_id, result, duration)
+        logger.info(f"[{POD_ID}-worker-{worker_pid}] Completed in {duration:.2f}s. Result: {result}")
+
+        return (request_id, result, duration, None)
+
+    except Exception as e:
+        duration = time.time() - start_time if 'start_time' in locals() else 0
+        error_msg = f"Error processing fibonacci({n}): {str(e)}"
+        logger.error(f"[{POD_ID}-worker-{worker_pid}] {error_msg}", exc_info=True)
+        return (request_id, None, duration, error_msg)
 
 
 def mark_completed(db, result_tuple):
@@ -119,22 +128,38 @@ def mark_completed(db, result_tuple):
 
     Args:
         db: MongoDB database
-        result_tuple: (request_id, result, duration)
+        result_tuple: (request_id, result, duration, error)
     """
-    request_id, result, duration = result_tuple
+    request_id, result, duration, error = result_tuple
 
-    db.requests.update_one(
-        {"request_id": request_id},
-        {
-            "$set": {
-                "completed": True,
-                "result": result,
-                "duration_seconds": duration,
-                "completed_at": datetime.utcnow()
-            }
+    try:
+        update_data = {
+            "completed": True,
+            "duration_seconds": duration,
+            "completed_at": datetime.utcnow()
         }
-    )
-    logger.info(f"[{POD_ID}] Marked {request_id} as completed")
+
+        # If there was an error, mark as failed
+        if error:
+            update_data["error"] = error
+            update_data["failed"] = True
+            logger.warning(f"[{POD_ID}] Marking {request_id} as failed: {error}")
+        else:
+            update_data["result"] = result
+            update_data["failed"] = False
+
+        db.requests.update_one(
+            {"request_id": request_id},
+            {"$set": update_data}
+        )
+
+        if error:
+            logger.info(f"[{POD_ID}] Marked {request_id} as failed in database")
+        else:
+            logger.info(f"[{POD_ID}] Marked {request_id} as completed")
+
+    except Exception as e:
+        logger.error(f"[{POD_ID}] Failed to update database for {request_id}: {str(e)}", exc_info=True)
 
 
 def main():
@@ -143,12 +168,27 @@ def main():
 
     Runs up to 3 fibonacci calculations concurrently per instance.
     """
-    logger.info(f"[{POD_ID}] Worker started with 3 parallel workers...")
+    # Random startup delay to test log connection timing
+    startup_sleep = random.randint(1, 10)
+    time.sleep(startup_sleep)
+    logger.info(f"[{POD_ID}] Worker online -- slept {startup_sleep} seconds at startup")
 
-    db = get_mongo_db()
+    try:
+        db = get_mongo_db()
+        logger.info(f"[{POD_ID}] Connected to MongoDB")
+    except Exception as e:
+        logger.error(f"[{POD_ID}] Failed to connect to MongoDB: {str(e)}", exc_info=True)
+        raise
 
     # Create pool of 3 worker processes
-    with Pool(processes=3) as pool:
+    try:
+        pool = Pool(processes=3)
+        logger.info(f"[{POD_ID}] Created worker pool with 3 processes")
+    except Exception as e:
+        logger.error(f"[{POD_ID}] Failed to create worker pool: {str(e)}", exc_info=True)
+        raise
+
+    with pool:
         active_tasks = []  # List of (AsyncResult, work_dict) tuples
 
         while True:
@@ -171,15 +211,18 @@ def main():
 
                 # Try to claim more work if we have capacity
                 if len(active_tasks) < 3:
-                    work = try_claim_work(db)
+                    try:
+                        work = try_claim_work(db)
 
-                    if work:
-                        # Submit work to pool
-                        logger.info(f"[{POD_ID}] Claimed work, submitting to pool ({len(active_tasks)+1}/3 slots used)")
-                        async_result = pool.apply_async(process_work, (work,))
-                        active_tasks.append((async_result, work))
-                        # Immediately try to claim more work
-                        continue
+                        if work:
+                            # Submit work to pool
+                            logger.info(f"[{POD_ID}] Claimed work, submitting to pool ({len(active_tasks)+1}/3 slots used)")
+                            async_result = pool.apply_async(process_work, (work,))
+                            active_tasks.append((async_result, work))
+                            # Immediately try to claim more work
+                            continue
+                    except Exception as e:
+                        logger.error(f"[{POD_ID}] Error claiming or submitting work: {str(e)}", exc_info=True)
 
                 # If pool is full or no work available, sleep briefly
                 if len(active_tasks) >= 3:
